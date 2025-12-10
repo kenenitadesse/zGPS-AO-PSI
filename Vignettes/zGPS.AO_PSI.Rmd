@@ -1,0 +1,400 @@
+
+---
+title: "Advances in Ontology--Based Mining of Adverse Drug Reactions"
+author: "Kenenisa Tadesse, Dr. Pietro Belloni, Prof. Alessandra Rosalba Brazzale"
+date: "2025-12-10"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,         # show code in output
+  widgetframe = TRUE,  # wrap HTML widgets in iframe
+  message = FALSE,     # suppress messages
+  warning = FALSE      # suppress warnings
+)
+```
+
+
+
+
+`
+
+## Data Loading
+
+The analysis uses Veneto pharmacovigilance data, MedDRA mappings, and precomputed merging lists. All files are loaded using project-relative paths to ensure reproducibility on GitHub.
+
+
+```{r}
+load("drug_ae_veneto.rda")
+load("dd.meddra.rda")
+load("merge_list.rda")
+
+```
+## Load Required Libraries
+```{r}
+library(questionr)
+library(pscl)
+library(MASS)
+library(doRNG)
+library(parallel)
+library(doParallel)
+library(ggplot2)
+library(plotly)
+library(viridis)
+library(hrbrthemes)
+library(ggrepel)
+library(purrr)
+library(dplyr)
+library(tidyr)
+library(pROC)
+library(tidyverse)
+library(caret)
+library(openEBGM)
+```
+
+```{r}
+source("Functions.R")  
+source("plot.R")       
+source("zGPS.AO_bootstrap.R")
+source("zGPS.AO_tool.R")
+source("compute_GPS.R")  # for GPS
+```
+
+
+
+
+## Drug–AE Reporting Data
+
+The dataset drug_ae_veneto contains spontaneous reports linking drugs to adverse events. Each report may include multiple drugs and AEs.
+
+The dataset `drug_ae_veneto` has three columns:
+
+- **ID**: Unique identifier of each report
+- **DRUG_NAME**: Name(s) of drug(s) reported in the report
+- **AE_NAME**: Name(s) of reported adverse events
+
+```{r}
+head(drug_ae_veneto, 10)
+```
+## MedDRA AE Group Mapping
+
+This dataset provides AE group definitions based on MedDRA, allowing aggregation of individual AEs into AE groups for more robust analysis. Some AE groups may overlap slightly. The dataset `dd.meddra` has two columns:
+
+- **AE_NAME**: Name of the adverse event
+- **GROUP_NAME**: Name of the AE group
+
+```{r}
+head(dd.meddra, 10)
+
+```
+## Drugs of Interest
+
+Our model requires specifying the drugs to analyze via a special list called `merge_list`. This list also allows merging multiple drugs into a single category.
+
+Each element of `merge_list` is a list of length 2:
+
+- A character vector of drug names to merge
+- A single character string defining the merged drug category
+
+For example:
+
+
+```{r}
+merge_list_I <- list(
+  list(c('DRUG_A', 'DRUG_B'), 'DRUG_AB'),
+  list(c('DRUG_C'), 'DRUG_C')
+)
+merge_list_I
+```
+
+## Main Analysis Function
+
+The main function `zGPS.AO_tool` performs an end-to-end analysis of drug–AE associations. It calculates both group-level and AE-level relative risks (`s` and `lambda_hat`) and prepares the data for empirical p-value estimation.
+
+The key parameters include:
+
+- `dd.meddra`: the AE group mapping
+- `drug_ae_veneto`: the drug–AE report data
+- `merge_list`: defines which drugs to analyze together (in this example, each drug is treated individually)
+- `min_freq`: minimum frequency threshold for AEs to be included in the analysis
+- `min_size`: minimum number of AEs required in a group
+
+For example:
+
+```{r}
+res <- zGPS.AO_tool(
+  dd.meddra,
+  drug_ae_veneto,
+  merge_list,
+  min_freq = 15,
+  min_size = 15
+)
+```
+
+## Bootstrap Evaluation
+
+To assess statistical significance, we apply a bootstrap procedure using `zGPS.AO_bootstrap`. This computes empirical p-values for both group-level (`s`) and AE-level (`lambda_hat`) parameters.
+We apply a bootstrap procedure using zGPS.AO_bootstrap to compute empirical p-values for both group-level (`s`) and AE-level (`lambda_hat`) parameters. The procedure is parallelized across 4 cores.
+
+```{r}
+
+res <- zGPS.AO_bootstrap(res, n_perm = 4000, n_cores = 4)
+
+```
+
+The resulting `res` object contains group level RR `s`, group level parameters `r`, 'beta', and `p`, AE level RR `lambda_hat` and p values.
+
+## Visualization
+
+## The Group level RR heatmap
+Interactive heatmap of all drug-AE group combinations
+
+```{r, fig.width=10, fig.height=8}
+plot.zGPS.AO(res,
+          interactive_plot = TRUE)
+```
+
+
+## The AE level RR scatter plot
+
+## Targeted drug–AE group plots
+
+The most significant group-level RR is observed between LIXANA and Vascular haemorrhagic disorders. AE-level RR within specific AE groups can be explored interactively.
+
+```{r, fig.width=16, fig.height=8}
+plot.zGPS.AO(res,
+          interactive_plot = TRUE,
+          drug_name = c('ACIDO ACETILSALICILICO'),
+          AE_grp_name = 'Allergic conditions')
+```
+
+## GPS (Gamma–Poisson Shrinkage) Computation
+
+We fit the Gamma–Poisson shrinkage model by extracting the expected counts `E` and observed counts `Y` from the results of the previously computed `zGPS.AO`.
+
+```{r}
+ebgm_results <- compute_GPS(res)
+
+```
+We then merge the EBGM estimates back with the main dataset for further comparison and analysis.
+
+```{r}
+zGPS.AO_GPS <- res$big_data %>%
+  left_join(ebgm_results, by = c("AE_grp", "drug", "AE", "y", "E"))
+```
+
+#  Compute Pearson Correlation
+To assess the agreement between model-based estimates and EBGM, we compute the Pearson correlation between `lambda_hat` and `EBGM`.
+```{r}
+correlation <- cor(zGPS.AO_GPS$lambda_hat, zGPS.AO_GPS$EBGM, method = "pearson")
+print(paste("Pearson correlation: ", round(correlation, 4)))
+
+```
+#  Identify Significant Signals
+
+We flag significant signals from both the zGPS.AO and GPS (EBGM) estimates. A signal is considered significant for zGPS.AO if `lambda_hat > 2` with `lambda_pval < 0.01`, and for GPS if `EBGM > 2` with `quan01 > 2`. We also categorize each observation by the type of significant signal.
+
+```{r}
+
+zGPS.AO_GPS <- zGPS.AO_GPS %>%
+  mutate(
+    Significant_ZGPS.AO = lambda_hat > 2 & lambda_pval < 0.01,
+    Significant_GPS  = EBGM > 2 & quan01 > 2,
+    Signal_Type = case_when(
+      Significant_GPS & Significant_ZGPS.AO  ~ "Both",
+      Significant_GPS & !Significant_ZGPS.AO ~ "GPS only",
+      !Significant_GPS & Significant_ZGPS.AO ~ "ZGPS.AO only",
+      TRUE ~ "None"
+    )
+  )
+```
+# Scatter Plots Comparing zGPS.AO vs GPS
+
+To visualize agreement and differences between zGPS.AO and GPS estimates, we create a scatter plot of lambda_hat versus EBGM. Points are colored by signal type, and a dashed bisector line indicates perfect agreement.
+
+```{r, fig.height=12, fig.width=12}
+
+lims <- range(c(zGPS.AO_GPS$lambda_hat, zGPS.AO_GPS$EBGM), na.rm = TRUE)
+
+# Scatter plot with bisector line
+p1 <- ggplot(zGPS.AO_GPS, aes(x = lambda_hat, y = EBGM, color = Signal_Type)) +
+  geom_point(alpha = 0.8, size = 4) +
+  geom_abline(slope = 1, intercept = 0, color = "black", linetype = "dashed", size = 1) +
+  labs(
+    title = expression("Scatter plot of zGPS.AO " * hat(lambda) * " vs GPS EBGM with significant signals"),
+    x = expression(hat(lambda) ~ "(zGPS.AO)"),
+    y = "EBGM (GPS)",
+    color = "Signal Significance"
+  ) +
+  scale_color_manual(values = c("Both" = "#E41A1C", "GPS only" = "#377EB8",
+                                "ZGPS.AO only" = "#4DAF4A", "None" = "#AAAAAA")) +
+  theme_minimal(base_size = 14) +
+  theme(
+  legend.position = "bottom",
+  legend.title = element_text(face = "bold", size = 14),
+  legend.text = element_text(size = 12))+
+  coord_equal(xlim = lims, ylim = lims, expand = TRUE)
+
+print(p1)
+
+```
+
+
+
+### Model Splitting and Post-Selection Inference
+
+To evaluate model performance under different data splitting strategies, we implemented three approaches for drug–AE count data: stratified sample splitting, random sample splitting, and data thinning. Each method produces, for every drug–AE pair, the following:
+
+- Training counts and expected counts,  
+- Predicted counts for the validation set,  
+- Sum of squared errors (SSE) computed **only on the validation set**.
+
+These validation SSEs are then used to calculate mean squared errors (MSE) at the overall, group, and drug levels, forming the basis for post-selection inference and model comparison.
+
+### Notes on Parameter Settings
+
+The proportion of data allocated to training and validation is controlled by `train_frac` for sample splitting and `thinning_ratio` for data thinning. Specifically:
+
+- `train_frac = 0.5` corresponds to 50% of counts for training and 50% for validation. Similarly, `thinning_ratio = c(0.5, 0.5)` splits the counts 50/50 between training and validation.
+- `train_frac = 0.6` corresponds to 60% training and 40% validation, with `thinning_ratio = c(0.6, 0.4)` producing the same allocation for thinned counts.
+- This pattern can be adjusted for any desired training/validation proportion.
+
+
+### Stratified Sample Splitting
+
+Stratified splitting preserves all observations by expanding aggregated counts into individual instances before dividing them into training and validation sets. This ensures all drugs and AEs appear in both subsets.
+
+
+```{r}
+# Load stratified splitting function
+
+source("Stratified_splitting_zGPS.AO.R")
+
+```
+```{r}
+
+strat<-zGPS.AO_stratified_split(dd.meddra, drug_ae_veneto,
+                         merge_list,
+                         min_freq = 15,
+                         min_size = 15,
+                         train_frac = 0.5,
+                         seed = 123)
+```
+### Random Sample Splitting
+
+Random splitting assigns observations randomly to training and validation sets, which may cause some drugs or AEs to be missing in one of the subsets.
+
+```{r}
+source("Random_splitting_zGPS.AO.R")
+rand<-zGPS.AO_random_split(dd.meddra, drug_ae_veneto,
+                         merge_list,
+                         min_freq = 15,
+                         min_size = 15,
+                         train_frac = 0.5,
+                         seed = 124)
+```
+### Data Thinning
+
+Data thinning splits counts at the observation level using convolution-closed distributions, which preserves all drugs and AEs while creating training and validation components.
+
+```{r}
+source("Thinning_zGPS.AO.R")
+
+thin<-zGPS.AO_thinning(dd.meddra, drug_ae_veneto,
+                merge_list,
+                min_freq = 15,
+                min_size = 15,
+                thinning_ratio = c(0.5, 0.5),
+                seed = 123)
+```
+
+## Performance Metrics Aggregation and Visualization Preparation
+This script aggregates model performance metrics derived from thinning, random splitting, and stratified splitting. It prepares overall, group-level, and drug-level MSE summaries and also structures the ROC-related data used for evaluating signal detection accuracy. The resulting outputs serve as inputs for all subsequent visualizations in the model comparison section.
+
+```{r}
+
+source("zGPS.AO_MSE_visualization_prep.R") # for post selection inference
+
+```
+
+
+
+
+
+# Overall MSE Comparison (Thinning vs Stratified Splitting)
+```{r, fig.height=12, fig.width=12}
+plot_zGPS.AO_psi(drug_level_mse_wide, "mean_MSE_sp_r", expression("" * "Overall MSE by " * "" * epsilon))
+```
+
+# Group-level MSE Comparison 
+```{r, fig.height=12, fig.width=12}
+plot_zGPS.AO_psi_group(drug_ae_level_mse_wide, "sp_r_bth", expression("" * "Group-level MSE by  " * "" * epsilon))
+```
+##  MSE Distribution Across Drugs
+
+
+```{r, fig.height=12, fig.width=12}
+plot_zGPS.AO_drug_eps(drug_level_mse_wide)
+
+```
+
+
+
+##  Overall MSE Comparison (Random Splitting Performance)
+
+
+
+
+
+
+```{r, fig.height=12, fig.width=12}
+plot_zGPS.AO_random(drug_level_mse_wide, NULL, expression("" * "Overall MSE by " * "" * epsilon))
+```
+
+#  Group-level MSE Comparison (Random Splitting Performance))
+
+```{r, fig.height=12, fig.width=12}
+plot_zGPS.AO_random_group(drug_ae_level_mse_wide, 
+                                        method_to_plot = "Data splitting (randomly)", 
+                                        title_expr = expression("" * "Group-level MSE by  " * "" * epsilon))
+```
+
+#  MSE Distribution Across Drugs (Random Splitting Performance))
+
+```{r, fig.height=12, fig.width=12}
+plot_zGPS.AO_drug_eps_random(drug_level_mse_wide)
+  
+```
+
+## ROC Curve Analysis Across Random Seeds
+
+This section visualizes the variation in ROC curves for signal detection by computing and plotting ROC curves for each random seed from 123 to 132. This allows assessment of model stability and robustness across different train-validation splits.
+
+
+```{r, fig.height=12, fig.width=8}
+plot_roc_curves(roc_data_comb)
+
+```
+
+## Comprehensive Performance Metrics Averaged Across Seeds
+
+This section visualizes model performance metrics—including AUC, accuracy, sensitivity, specificity, precision, and F1 score—averaged across 10 random seeds (123–132) to assess the stability and robustness of the three data splitting methods: thinning , stratified, and random.
+
+```{r, fig.height=12, fig.width=12}
+plot_performance_metrics(results_summary)
+
+```
+
+
+
+
+
+
+
+
+
